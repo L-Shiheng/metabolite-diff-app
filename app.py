@@ -1,173 +1,102 @@
-import streamlit as st
 import pandas as pd
-import numpy as np
+import sys
 
-st.set_page_config(page_title="代谢物注释差异对比", layout="wide")
-st.title("🧪 代谢物注释差异对比：non-ds vs ds")
-st.markdown("逐个离子对比校正前后的候选代谢物名称，清晰显示减少了哪些异构体。")
+def parse_name_set(name_str):
+    """将分号分隔的名称字符串解析为集合（去空格、去重）"""
+    if pd.isna(name_str) or str(name_str).strip() == "":
+        return set()
+    # 按分号拆分，去除每个名称的首尾空格，过滤空字符串
+    return {x.strip() for x in str(name_str).split(";") if x.strip()}
 
-# 侧边栏参数
-st.sidebar.header("⚙️ 匹配参数")
-mz_tol = st.sidebar.number_input("mz 容差 (Da)", value=0.01, step=0.001, format="%.4f")
-rt_tol = st.sidebar.number_input("保留时间容差 (min)", value=0.5, step=0.1, format="%.2f")
-pos_pattern = st.sidebar.text_input("正离子 adduct 包含的符号", value="+")
-neg_pattern = st.sidebar.text_input("负离子 adduct 包含的符号", value="-")
+def determine_diff_type_and_missing(non_set, ds_set):
+    """
+    根据非校正集和校正集名称集合返回 (diff_type, missing_names_str)
+    """
+    missing = non_set - ds_set
+    added = ds_set - non_set
 
-# 文件上传
-col1, col2 = st.columns(2)
-with col1:
-    non_file = st.file_uploader("上传 non-ds 文件", type=["csv"])
-with col2:
-    ds_file = st.file_uploader("上传 ds 文件", type=["csv"])
+    if non_set == ds_set:
+        diff_type = "无变化"
+        missing_str = ""
+    elif missing and not added:
+        # ds_set 是 non_set 的严格子集 → 候选名减少
+        diff_type = "候选名减少"
+        missing_str = ";".join(sorted(missing))
+    elif added and not missing:
+        # non_set 是 ds_set 的严格子集 → 候选名增加
+        diff_type = "候选名增加"
+        missing_str = ""   # 如需记录增加项可另加字段，这里保持 missing 为空
+    else:
+        # 既有增加又有减少，或相互替换
+        diff_type = "候选名改变（有增有减）"
+        missing_str = ";".join(sorted(missing))
+    return diff_type, missing_str
 
-if non_file and ds_file:
-    non_df = pd.read_csv(non_file)
-    ds_df = pd.read_csv(ds_file)
-
-    # 检查列
-    required = ['mz', 'rt', 'name', 'adduct']
-    for col in required:
-        if col not in non_df.columns or col not in ds_df.columns:
-            st.error(f"缺少列: {col}")
-            st.stop()
-
-    # 筛选正离子
-    non_pos = non_df[non_df['adduct'].str.contains(pos_pattern, na=False, regex=False)].copy()
-    ds_pos = ds_df[ds_df['adduct'].str.contains(pos_pattern, na=False, regex=False)].copy()
-
-    if len(non_pos) == 0 or len(ds_pos) == 0:
-        st.warning("正离子模式无数据，请检查 adduct 列。")
-        st.dataframe(non_df[['adduct']].drop_duplicates())
-        st.stop()
-
-    # 按 (mz, rt) 分组，收集名称集合
-    non_groups = non_pos.groupby(['mz', 'rt'])['name'].apply(lambda x: set(x.dropna())).reset_index()
-    ds_groups = ds_pos.groupby(['mz', 'rt'])['name'].apply(lambda x: set(x.dropna())).reset_index()
-    ds_features = [(row['mz'], row['rt'], row['name']) for _, row in ds_groups.iterrows()]
-
-    # 匹配并生成对比明细
-    details = []  # 存储每个特征的对比信息
-
-    for _, row in non_groups.iterrows():
-        mz_n, rt_n = row['mz'], row['rt']
-        names_n = row['name']
-
-        # 查找匹配的 ds 特征
-        best = None
-        best_dist = float('inf')
-        for mz_d, rt_d, names_d in ds_features:
-            if abs(mz_n - mz_d) <= mz_tol and abs(rt_n - rt_d) <= rt_tol:
-                dist = np.sqrt((mz_n - mz_d)**2 + (rt_n - rt_d)**2)
-                if dist < best_dist:
-                    best_dist = dist
-                    best = (mz_d, rt_d, names_d)
-
-        if best is not None:
-            mz_d, rt_d, names_d = best
-            missing = names_n - names_d
-            if missing:
-                diff_type = "候选名减少"
-                reason = f"校正后移除了以下异构体: {'; '.join(sorted(missing))}"
+def main(input_csv, output_csv=None):
+    """
+    读取输入 CSV，重新计算 diff_type 和 missing_names，输出到 output_csv
+    若不指定 output_csv，自动在原文件名后加 _corrected
+    """
+    if output_csv is None:
+        output_csv = input_csv.replace(".csv", "_corrected.csv")
+    
+    # 读取 CSV（注意处理可能的 BOM 头）
+    df = pd.read_csv(input_csv, encoding="utf-8-sig")
+    
+    # 确保必要的列存在
+    required_cols = ["non_names", "ds_names"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"输入 CSV 缺少必要列: {col}")
+    
+    # 为每一行计算新的 diff_type 和 missing_names
+    new_diff_types = []
+    new_missing_names = []
+    
+    for idx, row in df.iterrows():
+        non_set = parse_name_set(row["non_names"])
+        ds_set = parse_name_set(row["ds_names"])
+        diff_type, missing_str = determine_diff_type_and_missing(non_set, ds_set)
+        new_diff_types.append(diff_type)
+        new_missing_names.append(missing_str)
+    
+    # 覆盖原有列（如果存在）或添加新列
+    df["diff_type"] = new_diff_types
+    df["missing_names"] = new_missing_names
+    
+    # 可选：如果存在 reason 列但不再需要，可以保留或重新生成
+    # 这里保留原 reason 列，但您可以根据需要修改
+    if "reason" in df.columns:
+        # 可以根据新 diff_type 生成更准确的 reason，示例：
+        new_reasons = []
+        for diff_type, missing_str in zip(new_diff_types, new_missing_names):
+            if diff_type == "候选名减少":
+                reason = f"校正后移除了以下异构体: {missing_str}"
+            elif diff_type == "候选名增加":
+                reason = f"校正后新增了以下异构体: {ds_set - non_set}"  # 需额外计算
+            elif diff_type == "无变化":
+                reason = "校正后候选名无变化"
             else:
-                diff_type = "无差异"
-                reason = ""
-            details.append({
-                'mz_non': mz_n, 'rt_non': rt_n,
-                'mz_ds': mz_d, 'rt_ds': rt_d,
-                'non_names': '; '.join(sorted(names_n)),
-                'ds_names': '; '.join(sorted(names_d)),
-                'missing_names': '; '.join(sorted(missing)) if missing else '',
-                'diff_type': diff_type,
-                'reason': reason
-            })
+                reason = "校正后候选名发生增减/替换"
+            new_reasons.append(reason)
+        df["reason"] = new_reasons
+    
+    # 保存结果
+    df.to_csv(output_csv, index=False, encoding="utf-8-sig")
+    print(f"处理完成！结果已保存至: {output_csv}")
+
+if __name__ == "__main__":
+    # 用法示例：直接修改下面的文件名，或在命令行运行
+    # 方法1: 在代码中指定输入文件
+    input_file = "metabolite_diff (2).csv"   # 改为您的实际文件名
+    output_file = "metabolite_diff_corrected.csv"
+    
+    # 方法2: 从命令行参数获取
+    if len(sys.argv) > 1:
+        input_file = sys.argv[1]
+        if len(sys.argv) > 2:
+            output_file = sys.argv[2]
         else:
-            # 整个特征消失
-            details.append({
-                'mz_non': mz_n, 'rt_non': rt_n,
-                'mz_ds': '', 'rt_ds': '',
-                'non_names': '; '.join(sorted(names_n)),
-                'ds_names': '',
-                'missing_names': '; '.join(sorted(names_n)),
-                'diff_type': '整个特征消失',
-                'reason': '校正后该 mz-rt 特征未匹配到任何代谢物'
-            })
-
-    diff_df = pd.DataFrame(details)
-    # 只保留有差异的行（候选名减少 或 特征消失）
-    diff_df = diff_df[diff_df['diff_type'] != '无差异'].reset_index(drop=True)
-
-    st.subheader("📊 特征级对比明细")
-    st.write(f"共有 **{len(diff_df)}** 个特征存在差异（候选名减少或整个特征消失）")
-    st.write(f"其中候选名减少的特征数: {len(diff_df[diff_df['diff_type']=='候选名减少'])}")
-    st.write(f"其中整个特征消失的特征数: {len(diff_df[diff_df['diff_type']=='整个特征消失'])}")
-
-    # 在 Streamlit 中显示表格（简洁版）
-    st.dataframe(diff_df[['mz_non', 'rt_non', 'non_names', 'ds_names', 'missing_names', 'diff_type']],
-                 use_container_width=True)
-
-    # 生成 HTML 详细报告（带颜色标注）
-    html = """
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>代谢物注释差异对比报告</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 20px; }
-            table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
-            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }
-            th { background-color: #f2f2f2; }
-            .missing { color: red; font-weight: bold; }
-            .feature-gone { background-color: #ffe6e6; }
-        </style>
-    </head>
-    <body>
-        <h2>代谢物注释差异对比报告</h2>
-        <p>生成时间: """ + pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S") + """</p>
-        <table>
-            <thead>
-                <tr>
-                    <th>mz (non)</th><th>rt (non)</th><th>non-ds 候选名</th>
-                    <th>ds 候选名</th><th>缺失的候选名</th><th>差异类型</th><th>原因说明</th>
-                </tr>
-            </thead>
-            <tbody>
-    """
-
-    for _, row in diff_df.iterrows():
-        cls = "class='feature-gone'" if row['diff_type'] == '整个特征消失' else ""
-        missing_html = f"<span class='missing'>{row['missing_names']}</span>" if row['missing_names'] else ""
-        html += f"<tr {cls}>"
-        html += f"<td>{row['mz_non']}</td><td>{row['rt_non']}</td>"
-        html += f"<td>{row['non_names']}</td><td>{row['ds_names']}</td>"
-        html += f"<td>{missing_html}</td><td>{row['diff_type']}</td><td>{row['reason']}</td>"
-        html += "</tr>"
-
-    html += """
-            </tbody>
-        </table>
-        <p>注：红色字体表示在 ds 文件中缺失的代谢物名称。</p>
-    </body>
-    </html>
-    """
-
-    # 在 Streamlit 中直接显示 HTML（使用 components.html）
-    st.components.v1.html(html, height=600, scrolling=True)
-
-    # 下载 HTML 文件
-    st.download_button(
-        label="📄 下载 HTML 报告",
-        data=html.encode('utf-8'),
-        file_name="metabolite_diff_report.html",
-        mime="text/html"
-    )
-
-    # 同时提供 CSV 下载
-    csv_data = diff_df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📥 下载 CSV 差异清单", csv_data, "metabolite_diff.csv", "text/csv")
-
-    # 显示调试信息（可选）
-    with st.expander("🔎 查看原始分组数据（调试）"):
-        st.write("non-ds 特征分组")
-        st.dataframe(non_groups.head(10))
-        st.write("ds 特征分组")
-        st.dataframe(ds_groups.head(10))
+            output_file = input_file.replace(".csv", "_corrected.csv")
+    
+    main(input_file, output_file)
